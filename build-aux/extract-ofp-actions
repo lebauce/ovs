@@ -3,6 +3,7 @@
 import sys
 import os.path
 import re
+from optparse import OptionParser
 
 OFP_ACTION_ALIGN = 8
 
@@ -31,8 +32,6 @@ types['uint32_t'] = {"size": 4, "align": 4, "ntoh": None,     "hton": None}
 types['uint64_t'] = {"size": 8, "align": 8, "ntoh": None,     "hton": None}
 
 line = ""
-
-arg_structs = set()
 
 def round_up(x, y):
     return int((x + (y - 1)) / y) * y
@@ -80,9 +79,8 @@ OFP_ACTIONS.C should point to lib/ofp-actions.c.\
 ''' % {"argv0": argv0})
     sys.exit(0)
 
-def extract_ofp_actions(fn, definitions):
-    error_types = {}
-
+def extract_ofp_actions(fn):
+    arg_structs = set()
     comments = []
     names = []
     domain = {}
@@ -238,158 +236,330 @@ def extract_ofp_actions(fn, definitions):
     if n_errors:
         sys.exit(1)
 
+    return arg_structs, enums, domain
+
+
+def generate_declaration(versions):
+    need_ofp_version = False
+    for v in versions:
+        assert v["arg_len"] == versions[0]["arg_len"]
+        assert v["base_argtype"] == versions[0]["base_argtype"]
+        if (v["min_length"] != versions[0]["min_length"] or
+            v["arg_ofs"] != versions[0]["arg_ofs"] or
+            v["type"] != versions[0]["type"]):
+            need_ofp_version = True
+    base_argtype = versions[0]["base_argtype"]
+
+    decl = "static inline "
+    if base_argtype.startswith('struct'):
+        decl += "%s *" % base_argtype
+    else:
+        decl += "void"
+    decl += "\nput_%s(struct ofpbuf *openflow" % versions[0]["enum"].replace('_RAW', '', 1)
+    if need_ofp_version:
+        decl += ", enum ofp_version version"
+    if base_argtype != 'void' and not base_argtype.startswith('struct'):
+        decl += ", %s arg" % base_argtype
+    decl += ")"
+    return need_ofp_version, base_argtype, decl
+
+
+def make_definitions(arg_structs, enums, domain):
     print("""\
 /* Generated automatically; do not modify!     -*- buffer-read-only: t -*- */
 """)
 
-    if definitions:
-        print("/* Verify that structs used as actions are reasonable sizes. */")
-        for s in sorted(arg_structs):
-            print("BUILD_ASSERT_DECL(sizeof(%s) %% OFP_ACTION_ALIGN == 0);" % s)
+    print("/* Verify that structs used as actions are reasonable sizes. */")
+    for s in sorted(arg_structs):
+        print("BUILD_ASSERT_DECL(sizeof(%s) %% OFP_ACTION_ALIGN == 0);" % s)
 
-        print("\nstatic struct ofpact_raw_instance all_raw_instances[] = {")
-        for vendor in domain:
-            for type_ in domain[vendor]:
-                for version in domain[vendor][type_]:
-                    d = domain[vendor][type_][version]
-                    print("    { { 0x%08x, %2d, 0x%02x }, " % (
-                        vendor, type_, version))
-                    print("      %s," % d["enum"])
-                    print("      HMAP_NODE_NULL_INITIALIZER,")
-                    print("      HMAP_NODE_NULL_INITIALIZER,")
-                    print("      %s," % d["min_length"])
-                    print("      %s," % d["max_length"])
-                    print("      %s," % d["arg_ofs"])
-                    print("      %s," % d["arg_len"])
-                    print("      \"%s\"," % re.sub('_RAW[0-9]*', '', d["enum"], 1))
-                    if d["deprecation"]:
-                        print("      \"%s\"," % re.sub(r'(["\\])', r'\\\1', d["deprecation"]))
-                    else:
-                        print("      NULL,")
-                    print("    },")
-        print("};")
+    print("\nstatic struct ofpact_raw_instance all_raw_instances[] = {")
+    for vendor in domain:
+        for type_ in domain[vendor]:
+            for version in domain[vendor][type_]:
+                d = domain[vendor][type_][version]
+                print("    { { 0x%08x, %2d, 0x%02x }, " % (
+                    vendor, type_, version))
+                print("      %s," % d["enum"])
+                print("      HMAP_NODE_NULL_INITIALIZER,")
+                print("      HMAP_NODE_NULL_INITIALIZER,")
+                print("      %s," % d["min_length"])
+                print("      %s," % d["max_length"])
+                print("      %s," % d["arg_ofs"])
+                print("      %s," % d["arg_len"])
+                print("      \"%s\"," % re.sub('_RAW[0-9]*', '', d["enum"], 1))
+                if d["deprecation"]:
+                    print("      \"%s\"," % re.sub(r'(["\\])', r'\\\1', d["deprecation"]))
+                else:
+                    print("      NULL,")
+                print("    },")
+    print("};")
 
     for versions in enums.values():
-        need_ofp_version = False
-        for v in versions:
-            assert v["arg_len"] == versions[0]["arg_len"]
-            assert v["base_argtype"] == versions[0]["base_argtype"]
-            if (v["min_length"] != versions[0]["min_length"] or
-                v["arg_ofs"] != versions[0]["arg_ofs"] or
-                v["type"] != versions[0]["type"]):
-                need_ofp_version = True
-        base_argtype = versions[0]["base_argtype"]
-
-        decl = "static inline "
+        need_ofp_version, base_argtype, decl = generate_declaration(versions)
+        decl += "{\n"
+        decl += "    "
         if base_argtype.startswith('struct'):
-            decl += "%s *" %base_argtype
-        else:
-            decl += "void"
-        decl += "\nput_%s(struct ofpbuf *openflow" % versions[0]["enum"].replace('_RAW', '', 1)
+            decl += "return "
+        decl += "ofpact_put_raw(openflow, "
         if need_ofp_version:
-            decl += ", enum ofp_version version"
-        if base_argtype != 'void' and not base_argtype.startswith('struct'):
-            decl += ", %s arg" % base_argtype
-        decl += ")"
-        if definitions:
-            decl += "{\n"
-            decl += "    "
-            if base_argtype.startswith('struct'):
-                decl += "return "
-            decl += "ofpact_put_raw(openflow, "
-            if need_ofp_version:
-                decl += "version"
-            else:
-                decl += "%s" % versions[0]["version"]
-            decl += ", %s, " % versions[0]["enum"]
-            if base_argtype.startswith('struct') or base_argtype == 'void':
-                decl += "0"
-            else:
-                ntoh = types[base_argtype]['ntoh']
-                if ntoh:
-                    decl += "%s(arg)" % ntoh
-                else:
-                    decl += "arg"
-            decl += ");\n"
-            decl += "}"
+            decl += "version"
         else:
-            decl += ";"
+            decl += "%s" % versions[0]["version"]
+        decl += ", %s, " % versions[0]["enum"]
+        if base_argtype.startswith('struct') or base_argtype == 'void':
+            decl += "0"
+        else:
+            ntoh = types[base_argtype]['ntoh']
+            if ntoh:
+                decl += "%s(arg)" % ntoh
+            else:
+                decl += "arg"
+        decl += ");\n"
+        decl += "}"
         print(decl)
         print("")
 
-    if definitions:
-        print("""\
+    print("""\
 static enum ofperr
 ofpact_decode(const struct ofp_action_header *a, enum ofp_raw_action_type raw,
-              enum ofp_version version, uint64_t arg,
-              const struct vl_mff_map *vl_mff_map,
-              uint64_t *tlv_bitmap, struct ofpbuf *out)
+            enum ofp_version version, uint64_t arg,
+            const struct vl_mff_map *vl_mff_map,
+            uint64_t *tlv_bitmap, struct ofpbuf *out)
 {
     switch (raw) {\
 """)
-        for versions in enums.values():
-            enum = versions[0]["enum"]
-            print("    case %s:" % enum)
-            base_argtype = versions[0]["base_argtype"]
-            arg_vl_mff_map = versions[0]["arg_vl_mff_map"]
-            if base_argtype == 'void':
-                print("        return decode_%s(out);" % enum)
+    for versions in enums.values():
+        enum = versions[0]["enum"]
+        print("    case %s:" % enum)
+        base_argtype = versions[0]["base_argtype"]
+        arg_vl_mff_map = versions[0]["arg_vl_mff_map"]
+        if base_argtype == 'void':
+            print("        return decode_%s(out);" % enum)
+        else:
+            if base_argtype.startswith('struct'):
+                arg = "ALIGNED_CAST(const %s *, a)" % base_argtype
             else:
-                if base_argtype.startswith('struct'):
-                    arg = "ALIGNED_CAST(const %s *, a)" % base_argtype
+                hton = types[base_argtype]['hton']
+                if hton:
+                    arg = "%s(arg)" % hton
                 else:
-                    hton = types[base_argtype]['hton']
-                    if hton:
-                        arg = "%s(arg)" % hton
-                    else:
-                        arg = "arg"
-                if arg_vl_mff_map:
-                    print("        return decode_%s(%s, version, vl_mff_map, tlv_bitmap, out);" % (enum, arg))
-                else:
-                    print("        return decode_%s(%s, version, out);" % (enum, arg))
-            print("")
-        print("""\
+                    arg = "arg"
+            if arg_vl_mff_map:
+                print("        return decode_%s(%s, version, vl_mff_map, tlv_bitmap, out);" % (enum, arg))
+            else:
+                print("        return decode_%s(%s, version, out);" % (enum, arg))
+        print("")
+    print("""\
     default:
         OVS_NOT_REACHED();
     }
 }\
 """)
-    else:
-        for versions in enums.values():
-            enum = versions[0]["enum"]
-            prototype = "static enum ofperr decode_%s(" % enum
-            base_argtype = versions[0]["base_argtype"]
-            arg_vl_mff_map = versions[0]["arg_vl_mff_map"]
-            if base_argtype != 'void':
-                if base_argtype.startswith('struct'):
-                    prototype += "const %s *, enum ofp_version, " % base_argtype
-                else:
-                    prototype += "%s, enum ofp_version, " % base_argtype
-                if arg_vl_mff_map:
-                    prototype += 'const struct vl_mff_map *, uint64_t *, '
-            prototype += "struct ofpbuf *);"
-            print(prototype)
 
-        print("""
-static enum ofperr ofpact_decode(const struct ofp_action_header *,
-                                 enum ofp_raw_action_type raw,
-                                 enum ofp_version version,
-                                 uint64_t arg, const struct vl_mff_map *vl_mff_map,
-                                 uint64_t *tlv_bitmap, struct ofpbuf *out);
+
+def make_prototypes(arg_structs, enums, domain):
+    print("""\
+/* Generated automatically; do not modify!     -*- buffer-read-only: t -*- */
 """)
 
+    for versions in enums.values():
+        need_ofp_version, base_argtype, decl = generate_declaration(versions)
+        print(decl + ";")
+        print("")
+
+    for versions in enums.values():
+        enum = versions[0]["enum"]
+        prototype = "static enum ofperr decode_%s(" % enum
+        base_argtype = versions[0]["base_argtype"]
+        arg_vl_mff_map = versions[0]["arg_vl_mff_map"]
+        if base_argtype != 'void':
+            if base_argtype.startswith('struct'):
+                prototype += "const %s *, enum ofp_version, " % base_argtype
+            else:
+                prototype += "%s, enum ofp_version, " % base_argtype
+            if arg_vl_mff_map:
+                prototype += 'const struct vl_mff_map *, uint64_t *, '
+        prototype += "struct ofpbuf *);"
+        print(prototype)
+
+    print("""
+static enum ofperr ofpact_decode(const struct ofp_action_header *,
+                                enum ofp_raw_action_type raw,
+                                enum ofp_version version,
+                                uint64_t arg, const struct vl_mff_map *vl_mff_map,
+                                uint64_t *tlv_bitmap, struct ofpbuf *out);
+""")
+
+
+# make_loxigen uses a header file generated using
+# pahole -q -y nx_ libopenvswitch.a > nx-structs.h
+# pahole -q -y ext_action_header libopenvswitch.a >> nx-structs.h
+def make_loxigen(filename, arg_structs, enums, domain):
+    c_defs = """
+    typedef short ovs_be16;
+    typedef int ovs_be32;
+    typedef long long ovs_be64;
+    typedef unsigned char uint8_t;
+    """
+
+    types_len = {
+        "uint8_t": 1,
+        "ovs_be16": 2,
+        "ovs_be32": 4,
+        "ovs_be64": 8
+    }
+
+    loxi_types = {
+        "uint8_t": "uint8_t",
+        "ovs_be16": "uint16_t",
+        "ovs_be32": "uint32_t",
+        "ovs_be64": "uint64_t"
+    }
+
+    from pycparser import c_parser, c_ast, parse_file
+
+    class StructVisitor(c_ast.NodeVisitor):
+        def __init__(self):
+            c_ast.NodeVisitor.__init__(self)
+            self.structs = {}
+
+        def visit_Struct(self, struct):
+            self.structs[struct.name] = struct.children()
+
+    print("""// Copyright 2013, Big Switch Networks, Inc.
+//
+// LoxiGen is licensed under the Eclipse Public License, version 1.0 (EPL), with
+// the following special exception:
+//
+// LOXI Exception
+//
+// As a special exception to the terms of the EPL, you may distribute libraries
+// generated by LoxiGen (LoxiGen Libraries) under the terms of your choice, provided
+// that copyright and licensing notices generated by LoxiGen are not altered or removed
+// from the LoxiGen Libraries and the notice provided below is (i) included in
+// the LoxiGen Libraries, if distributed in source code form and (ii) included in any
+// documentation for the LoxiGen Libraries, if distributed in binary form.
+//
+// Notice: "Copyright 2013, Big Switch Networks, Inc. This library was generated by the LoxiGen Compiler."
+//
+// You may not use this file except in compliance with the EPL or LOXI Exception. You may obtain
+// a copy of the EPL at:
+//
+// http://www.eclipse.org/legal/epl-v10.html
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// EPL for the specific language governing permissions and limitations
+// under the EPL.
+
+#version any
+""")
+
+    parser = c_parser.CParser()
+    code = open(filename).read()
+    ast = parser.parse(c_defs + code, filename)
+
+    v = StructVisitor()
+    v.visit(ast)
+
+    vendor = vendor_map['NX'][0]
+    for i, type_ in enumerate(domain[vendor]):
+        versions = domain[vendor][type_].keys()
+        d = domain[vendor][type_][versions[-1]]
+
+        if d["enum"].startswith("OFPAT_RAW_"):
+            continue
+
+        if not d["enum"].startswith("NXAST_RAW_"):
+            raise Exception("Invalid enum type '%s'" % (d["enum"]))
+
+        name = d["enum"][10:].lower()
+
+        attrs = []
+        base_class = "of_action_nicira"
+        base_argtype = d["base_argtype"]
+        if d["base_argtype"].startswith("struct "):
+            struct_name = base_argtype.split()[1]
+            if struct_name not in v.structs:
+                raise Exception("Unknown struct '%s'" % (struct_name,))
+
+            for child in v.structs[struct_name][4:]:
+                decl = child[1]
+                attr_name = decl.name
+                if isinstance(decl.type, c_ast.Union):
+                    # Check that all enum values have the same type
+                    type_name = decl.type.decls[0].type.type.names[0]
+                    for member in decl.type.decls[1:]:
+                        if member.type.type.names[0] != type_name:
+                            raise Exception("All enum values should have the type '%s" % (type_name))
+                    attrs.append("%s value" % (loxi_types[type_name],))
+                elif attr_name.startswith("pad") or attr_name in ("zero", "zeros"):
+                    if isinstance(decl.type, c_ast.ArrayDecl):
+                        pad_size = int(decl.type.dim.value)
+                    else:
+                        type_name = decl.type.type.names[0]
+                        pad_size = types_len[type_name]
+                    attrs.append("pad(%d)" % (pad_size,))
+                elif isinstance(decl.type, c_ast.ArrayDecl):
+                    if isinstance(decl.type.type.type, c_ast.Struct):
+                        attrs.append("list(%s_t) %s" % (decl.type.type.type.name, attr_name))
+                    else:
+                        elem_type = decl.type.type.type.names[0]
+                        if elem_type != "uint8_t":
+                            raise Exception("Only array of bytes are supported, got '%s'" % (elem_type,))
+                        attrs.append("of_octets_t %s" % (attr_name,))
+                else:
+                    if isinstance(decl.type.type, c_ast.Struct):
+                        if len(attrs) == 0:
+                            base_class = "of_action_nx_" + decl.type.type.name[10:] # remove nx_action_
+                        else:
+                            attrs.append("%s_t %s" % (decl.type.type.name, attr_name))
+                    else:
+                        type_name = decl.type.type.names[0]
+                        attrs.append("%s %s" % (loxi_types[type_name], attr_name))
+
+        elif d["base_argtype"] == "void":
+            pass
+        else:
+            attrs.append("%s value" % (base_argtype,))
+
+        if i != 0:
+            print("")
+        print("struct of_action_nx_%s : %s {" % (name, base_class))
+        print("    uint16_t type == 65535;");
+        print("    uint16_t len;")
+        print("    uint32_t experimenter == 0x2320;")
+        print("    uint16_t subtype == %d;" % (type_,))
+        for attr in attrs:
+            print("    %s;" % (attr,))
+        print("};")
+
+
 if __name__ == '__main__':
-    if '--help' in sys.argv:
-        usage()
-    elif len(sys.argv) != 3:
-        sys.stderr.write("exactly two arguments required; "
-                         "use --help for help\n")
-        sys.exit(1)
-    elif sys.argv[2] == '--prototypes':
-        extract_ofp_actions(sys.argv[1], False)
-    elif sys.argv[2] == '--definitions':
-        extract_ofp_actions(sys.argv[1], True)
-    else:
-        sys.stderr.write("invalid arguments; use --help for help\n")
+    parser = OptionParser()
+    parser.add_option("--prototypes", action="store_true", dest="prototypes")
+    parser.add_option("--definitions", action="store_true", dest="definitions")
+    parser.add_option("--loxigen", action="store_true", dest="loxigen")
+    (options, args) = parser.parse_args()
+
+    if len(args) < 1:
+        sys.stderr.write("input file required\n")
+        parser.print_usage()
         sys.exit(1)
 
+    arg_structs, enums, domain = extract_ofp_actions(args[0])
+
+    if options.prototypes:
+        make_prototypes(arg_structs, enums, domain)
+    elif options.definitions:
+        make_definitions(arg_structs, enums, domain)
+    elif options.loxigen:
+        if len(args) < 2:
+            sys.stderr.write("header file required\n")
+            sys.exit(1)
+        make_loxigen(args[1], arg_structs, enums, domain)
+    else:
+        parser.print_usage()
+        sys.exit(1)
